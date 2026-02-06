@@ -1,0 +1,17 @@
+# Compilation et Binaires
+/Debug/
+/Release/
+*.elf
+*.bin
+*.hex
+*.o
+*.obj
+*.lst
+*.map
+
+# Fichiers systèmes ou IDE
+.settings/
+.project
+.cproject
+*.launch
+.mxproject
