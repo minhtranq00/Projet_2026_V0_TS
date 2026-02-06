@@ -6,7 +6,7 @@
   ******************************************************************************
   * @attention
   *
-  * Copyright (c) 2026 STMicroelectronics.
+  * Copyright (c) 2025 STMicroelectronics.
   * All rights reserved.
   *
   * This software is licensed under terms that can be found in the LICENSE file
@@ -21,7 +21,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "string.h"
+#include "stdio.h"
 
+#include "mc_type.h"
+#include "math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,6 +35,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// Active/desactive partie de code
+#define ON_OFF 0
+#define Vitesse 0
+#define cmd_rasb 1
 
 /* USER CODE END PD */
 
@@ -42,14 +50,19 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
-DAC_HandleTypeDef hdac;
-
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 DMA_HandleTypeDef hdma_tim1_ch4_trig_com;
 DMA_HandleTypeDef hdma_tim1_up;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
+
+volatile uint8_t fault_latched = 0;
+
+//Ajoute un ID d'ack
+uint8_t ID_order_ack = 0x40; //0x40 = ACK FAULT
 
 /* USER CODE END PV */
 
@@ -58,9 +71,9 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_DAC_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_USART1_UART_Init(void);
 static void MX_NVIC_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -68,6 +81,69 @@ static void MX_NVIC_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+//DEF ID (trame UART) TX
+uint8_t ID_vitesse = 0x00;
+uint8_t ID_current = 0x01;
+uint8_t ID_voltage = 0x02;
+uint8_t ID_position = 0x03;
+uint8_t ID_message = 0x10;
+uint8_t ID_error_temp = 0x20;
+
+//DEF ID (trame UART) RX
+uint8_t ID_order_start = 0x10;
+uint8_t ID_order_stop = 0x20;
+uint8_t ID_order_reset = 0x30;
+uint8_t ID_order_vitesse = 0x00;
+
+//Variable measure
+int16_t measure_vitesse = 0;
+int16_t measure_current = 0;
+int16_t measure_voltage = 0;
+int16_t measure_temp = 0;
+int16_t measure_pos = 0;
+
+//Variable ordre
+uint16_t vitesse = 65;
+uint16_t value_order = 0;
+//COM UART
+volatile uint8_t buffer_RX[5];
+uint8_t nbr_octet_tram = 3;
+
+//Error
+char buffer_error[64];
+uint16_t faults=0;
+
+//Commande boucle ouverte
+ float w = 2*3.14;
+ float angle_elec = 0;
+ int16_t v_alpha = 0;//Debug
+ int16_t v_beta = 0;//Debug
+
+
+// Flags
+volatile uint8_t new_order = 0;
+
+ struct _AppFlags_t {
+   uint8_t t1;
+   uint8_t read_sensors;
+ } AppFlags = {0};
+
+// Timers
+ struct _AppTimer_t {
+   unsigned int delayInMs;
+   uint8_t* flagPtr;
+ } AppTimers[] = {
+   // Intervalle (ms)  Flag
+   { 100,              &AppFlags.t1 },
+   { 100,             &AppFlags.read_sensors }
+ };
+
+// Fonctions
+ void transmission_message(const char *message, uint8_t ID_message)
+ {
+	 HAL_UART_Transmit(&huart1, &ID_message, 1, 100);
+	 HAL_UART_Transmit(&huart1, (uint8_t *)message, strlen(message), 100);
+ }
 
 /* USER CODE END 0 */
 
@@ -102,14 +178,32 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-  MX_DAC_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_MotorControl_Init();
+  MX_USART1_UART_Init();
 
   /* Initialize interrupts */
   MX_NVIC_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, buffer_RX, nbr_octet_tram);//start RX
+    //PREAMBULE
+    HAL_GPIO_TogglePin (LED_VERTE_GPIO_Port, LED_VERTE_Pin);
+    HAL_Delay(1000);
+    HAL_GPIO_TogglePin (LED_VERTE_GPIO_Port, LED_VERTE_Pin);
+    transmission_message("COM UART OK!\n", ID_message);
+    HAL_Delay(1000);
+    //FIN PREAMBULE
+
+    //Commande courant
+    qd_t Iqd;
+    Iqd.q = 1;
+    Iqd.d = 0;
+
+    //Commande boucle ouverte
+    alphabeta_t Valpha_beta;
+    Valpha_beta.alpha = 0;
+    Valpha_beta.beta = 0;
 
   /* USER CODE END 2 */
 
@@ -117,12 +211,230 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* Génération du temps */
+    uint32_t tickstart = HAL_GetTick();
+    static uint32_t lastTick = 0;
+
+    /* 100 ms = 200 ticks car 0.5 ms par tick */
+    if ((tickstart - lastTick) >= 200)
+    {
+      lastTick += 200;
+      AppFlags.read_sensors = 1;
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+#if ON_OFF
+	  MC_StartMotor1();
+	  HAL_Delay(10000);
+	  MC_StopMotor1();
+	  HAL_Delay(10000);
+#else
+#if Vitesse
+	  MC_ProgramSpeedRampMotor1(vitesse, 5000);
+	  MC_StartMotor1();
+	  if(vitesse == 10)
+	  {
+		  vitesse = 1000;
+	  }
+	  else
+	  {
+		  vitesse = 10;
+	  }
+	  HAL_Delay(5000);
+	  MC_StopMotor1();
+	  HAL_Delay(5000);
+#else
+#if cmd_rasb
+	  // MC_GetMecSpeedAverageMotor1();//MC_GetImposedDirectionMotor1();
+	  // mc_interface.h ==> CODE des mots clés (IDLE,START....)
+	  // mc_type.h ==> CODE des mots clés erreur
+	  // mc_stm_types.h  ==> SPEED_UNIT et U_RPM
+	  // parametre par defaut ==> parameters_conv (vitesse ligne 75)
+	  // pwm_curr_fdbk.h ==> #define SQRT3FACTOR ((uint16_t)0xDDB4) /* = (16384 * 1.732051 * 2)*/
+	  // Attention le tableau réel est msg2[0] = R, msg2[1] = e ... , msg2[9] = T, msg2[9] = \n, msg2[10] = \0 (0x00)
+	  // Temperature (ntc_temperature_sensor.c in Middleware/Motorcontrol/) :
+MCI_State_t state = MC_GetSTMStateMotor1();
+static MCI_State_t last_state = IDLE;
+
+/* N'envoie l'état qu'à chaque transition, pas en boucle */
+if(state != last_state)
+{
+  last_state = state;
+  sprintf(buffer_error, "Transition d'état : %u\n", (unsigned)state);
+  transmission_message(buffer_error, ID_message);
+}
+
+/* Mettre à jour la température */
+measure_temp = NTC_GetAvTemp_C(&TempSensor_M1); 
+
+/* 0 - Protection température */
+if(measure_temp >= 100)
+{
+  MC_StopMotor1();
+  HAL_UART_Transmit(&huart1, &ID_error_temp, 1, 1000);
+  continue; //ne pas exécuter le reste du code
+}
+
+/*1 - Détection FAULT -> latch + stop*/
+if ((state == FAULT_NOW) || (state == FAULT_OVER))
+{
+  if (!fault_latched) //ne pas spammer en boucle
+  {
+    fault_latched = 1;
+
+    //Stop moteur
+     MC_StopMotor1();
+
+    //Log UART
+    transmission_message("ERREUR\n", ID_message);
+    sprintf(buffer_error, "Etat = %u\n", state);
+    transmission_message(buffer_error,ID_message);
+
+    faults = MC_GetOccurredFaultsMotor1();
+    sprintf(buffer_error, "Erreur : %04X\n", faults);
+    transmission_message(buffer_error, ID_message);
+
+    transmission_message("Attente ACK ou RESET\n", ID_message);
+  }
+}
+
+/*2 - Si fault latched : on bloque toute action moteur (sauf ACK/RESET)*/
+if (fault_latched)
+{
+  //Renvoie l'état périodiquement
+  //On ne fait pas la lecture capteurs / ordre moteur normalement
+  //On traite uniquement les ordres UART liés à la sécurité 
+  if(new_order)
+  {
+    new_order = 0;
+
+    if(buffer_RX[0] == ID_order_stop)
+    {
+      MC_StopMotor1();
+      transmission_message("STOP OK (fault latched)\n", ID_message);
+    }
+    else if((buffer_RX[0] == ID_order_reset) || (buffer_RX[0] == ID_order_ack))
+    {
+      MC_StopMotor1();
+
+      if(buffer_RX[0] == ID_order_reset)
+      {
+        vitesse = 500;
+        transmission_message("RESET demande\n", ID_message);
+      }
+      else
+      {
+        transmission_message("ACK FAULT demande\n", ID_message);
+      }
+
+      MC_AcknowledgeFaultMotor1(); //tentative de réarmement
+    
+      //On relit l'état pour savoir si le fault est parti
+      state =  MC_GetSTMStateMotor1();
+      if((state != FAULT_NOW) && (state != FAULT_OVER))
+      {
+        fault_latched = 0;
+        transmission_message("Fault Cleared (IDLE)\n", ID_message);
+      }
+      else
+      {
+        transmission_message("Fault encore present\n", ID_message);
+      }
+    }
+    else
+    {
+      transmission_message("Ignore Fault : Latched\n", ID_message);
+    }
+  }
+
+  //Sort ici pour éviter de continuer le code normal
+  //Dans un while(1), ça continue la prochaine itération
+  continue;
+}
+
+/*3 - Pas de fault latched : fonctionnement normal*/
+	if(AppFlags.read_sensors)
+		{
+	    AppFlags.read_sensors = 0;
+
+	  measure_vitesse = MC_GetMecSpeedAverageMotor1();
+		HAL_UART_Transmit(&huart1, &ID_vitesse, 1, 1000);
+		HAL_UART_Transmit(&huart1, (uint8_t*)&measure_vitesse, sizeof(measure_vitesse), 1000);
+
+		measure_current = MC_GetPhaseCurrentAmplitudeMotor1();
+		HAL_UART_Transmit(&huart1, &ID_current, 1, 1000);
+		HAL_UART_Transmit(&huart1, (uint8_t*)&measure_current, sizeof(measure_current), 1000);
+
+		measure_voltage = VBS_GetAvBusVoltage_V(&BusVoltageSensor_M1);
+		HAL_UART_Transmit(&huart1, &ID_voltage, 1, 1000);
+		HAL_UART_Transmit(&huart1, (uint8_t*)&measure_voltage, sizeof(measure_voltage), 1000);
+
+		measure_temp = NTC_GetAvTemp_C(&TempSensor_M1);
+
+		measure_pos = (int16_t)(MC_GetCurrentPosition1()*100);
+		HAL_UART_Transmit(&huart1, &ID_position, 1, 1000);
+		HAL_UART_Transmit(&huart1, (uint8_t*)&measure_pos, sizeof(measure_pos), 1000);
+
+		if(state == RUN)
+			{
+			//MC_SetCurrentReferenceMotor1(Iqd); //Commande en courant
+			MC_ProgramSpeedRampMotor1(vitesse, 1000); //Commande en vitesse
+			transmission_message("RUN\n", ID_message);
+
+			//Commande en boucle ouverte (Test)
+			//Valpha_beta.alpha = (int16_t)(50*cos(angle_elec)*10);
+			//Valpha_beta.beta  = (int16_t)(50*sin(angle_elec)*10);
+			//	v_beta = Valpha_beta.beta; //Debug
+			//  v_alpha = Valpha_beta.alpha;//Debug
+			//PWMC_SetPhaseVoltage(pwmcHandle[M1], Valpha_beta);
+			//angle_elec += 0.1;
+			//angle_elec += w*0.05; //Tour mécanique en 8s
+			/*if(angle_elec >= (2*3.14))
+				{
+				angle_elec =  0;
+				}*/
+			//Fin commande en boucle ouverte (Test)
+
+			}
+		}
+	if(new_order)
+		{
+		new_order = 0;
+		if(buffer_RX[0] == ID_order_vitesse)//Ordre de vitesse
+			{
+			value_order = ((buffer_RX[2] << 8) | buffer_RX[1]);
+			if((value_order < 50))
+				vitesse = 50;
+			else if(value_order >500)
+				vitesse = 500;
+			else
+				vitesse = value_order;
+			}
+		else if(buffer_RX[0] == ID_order_start)//Ordre de start
+			{
+			MC_ProgramSpeedRampMotor1(vitesse, 1000);
+			MC_StartMotor1();
+			}
+		else if(buffer_RX[0]== ID_order_stop)//Ordre de stop
+			{
+			MC_StopMotor1();
+			}
+		else if (buffer_RX[0] == ID_order_reset)//Ordre de reset
+			{
+			MC_StopMotor1();
+			vitesse = 500;
+			}
+		}
+	}
+#else
+
+#endif
+#endif
+#endif
   }
   /* USER CODE END 3 */
-}
+
 
 /**
   * @brief System Clock Configuration
@@ -162,7 +474,8 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_TIM1;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_TIM1;
+  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_SYSCLK;
   PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_PLLCLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
@@ -294,46 +607,6 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
-
-}
-
-/**
-  * @brief DAC Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_DAC_Init(void)
-{
-
-  /* USER CODE BEGIN DAC_Init 0 */
-
-  /* USER CODE END DAC_Init 0 */
-
-  DAC_ChannelConfTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN DAC_Init 1 */
-
-  /* USER CODE END DAC_Init 1 */
-
-  /** DAC Initialization
-  */
-  hdac.Instance = DAC;
-  if (HAL_DAC_Init(&hdac) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** DAC channel OUT1 config
-  */
-  sConfig.DAC_Trigger = DAC_TRIGGER_SOFTWARE;
-  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_DISABLE;
-  if (HAL_DAC_ConfigChannel(&hdac, &sConfig, DAC_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN DAC_Init 2 */
-
-  /* USER CODE END DAC_Init 2 */
 
 }
 
@@ -480,6 +753,41 @@ static void MX_TIM2_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -503,9 +811,19 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LED_VERTE_GPIO_Port, LED_VERTE_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : Start_Stop_Pin */
+  GPIO_InitStruct.Pin = Start_Stop_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Start_Stop_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : M1_ENCODER_Z_Pin */
   GPIO_InitStruct.Pin = M1_ENCODER_Z_Pin;
@@ -513,12 +831,41 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(M1_ENCODER_Z_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : LED_VERTE_Pin */
+  GPIO_InitStruct.Pin = LED_VERTE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_VERTE_GPIO_Port, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  new_order = 1;
+  HAL_UART_Receive_IT(&huart1, buffer_RX, nbr_octet_tram);
+}
+/*void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+ 	 HAL_GPIO_WritePin(LED_VERTE_GPIO_Port,LED_VERTE_Pin , GPIO_PIN_SET);
+}*/
+//	Fonction pour les timers
+void HAL_SYSTICK_Callback(void)
+{
+  //for (unsigned int appTimerIndex = 0;
+    //appTimerIndex < sizeof(AppTimers) / sizeof(struct _AppTimer_t);
+    //appTimerIndex++)
+  //{
+    //if (HAL_GetTick() % AppTimers[appTimerIndex].delayInMs == 0)
+    //{
+        //*AppTimers[appTimerIndex].flagPtr = 1;
+    //}
+  //}
+}
 
 /* USER CODE END 4 */
 
@@ -552,3 +899,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
